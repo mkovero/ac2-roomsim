@@ -1,0 +1,42 @@
+[package]
+name = "ac2-roomsim"
+description = "Geometric room acoustics for prism-shaped rooms: image sources with visibility, stochastic ray tracing, ISO 9613-1 air absorption, per-octave-band echograms."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/mkovero/ac2-roomsim"
+readme = "README.md"
+keywords = ["acoustics", "room-acoustics", "ray-tracing", "image-source", "audio"]
+categories = ["science", "simulation", "multimedia::audio"]
+include = ["/src", "/README.md", "/LICENSE"]
+
+[features]
+default = []
+# Serialize/deserialize the input and output types (a daemon sends them to a UI).
+serde = ["dep:serde"]
+
+[dependencies]
+rayon = "1.11"
+rand_core = "0.6"
+rand_pcg = "0.3"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# The ray tracer is a tight floating-point loop; unoptimised it is 20–50 times slower, which
+# would push the statistical tests (tens of thousands of rays) into minutes.
+[profile.test]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1

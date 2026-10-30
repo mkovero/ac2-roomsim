@@ -1,0 +1,22 @@
+# Two tiers. A test whose name starts with `slow_` traces enough rays for a tight
+# statistical tolerance and takes seconds; the default profile skips them, `--profile full`
+# (and plain `cargo test`) runs everything.
+
+[profile.default]
+default-filter = "not test(/(^|::)slow_/)"
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 6 }
+failure-output = "final"
+
+[profile.full]
+default-filter = "all()"
+
+[profile.ci]
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# CI runs the quick tier with `ci`, then only the `slow_` tests with `ci-full`.
+[profile.ci-full]
+default-filter = "test(/(^|::)slow_/)"
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 5 }
