@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::band::{BAND_COUNT, Band, PerBand};
-use crate::echogram::{Echogram, IrError, synthesize_ir};
+use crate::echogram::{Echogram, IrError, synthesize_band_irs, synthesize_ir};
 use crate::image::{Arrival, arrivals, images};
 use crate::ray::{RayCtx, trace_chunk};
 use crate::room::Prism;
@@ -229,6 +229,18 @@ impl ReceiverResult {
     /// (see [`synthesize_ir`]). The same seed gives the same samples.
     pub fn impulse_response(&self, sample_rate: f64, seed: u64) -> Result<Vec<f64>, IrError> {
         synthesize_ir(&self.arrivals, &self.late, sample_rate, seed)
+    }
+
+    /// One synthesised impulse response per octave band (indexed by [`Band::index`]), each
+    /// holding only that band's energy (see [`synthesize_band_irs`]); they sum to
+    /// [`Self::impulse_response`] with the same seed. For per-band decay analysis these
+    /// need no band filter of the consumer's, whose skirts would let other bands in.
+    pub fn band_impulse_responses(
+        &self,
+        sample_rate: f64,
+        seed: u64,
+    ) -> Result<[Vec<f64>; BAND_COUNT], IrError> {
+        synthesize_band_irs(&self.arrivals, &self.late, sample_rate, seed)
     }
 }
 

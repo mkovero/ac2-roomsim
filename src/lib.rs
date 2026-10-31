@@ -43,6 +43,7 @@
 mod air;
 mod band;
 mod echogram;
+mod fft;
 mod image;
 mod material;
 mod ray;
@@ -53,7 +54,7 @@ mod vec3;
 
 pub use air::Air;
 pub use band::{BAND_COUNT, Band, PerBand};
-pub use echogram::{Echogram, IrError, synthesize_ir};
+pub use echogram::{Echogram, IrError, synthesize_band_irs, synthesize_ir};
 pub use image::Arrival;
 pub use material::{Coefficients, Material, MaterialId};
 pub use room::{Prism, Room, RoomError, SurfaceId, Surfaces};

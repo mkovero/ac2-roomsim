@@ -1,7 +1,10 @@
 //! Echograms (energy per time bin per band), their Schroeder decay, and synthesis of an
 //! impulse response from them.
 
+use rayon::prelude::*;
+
 use crate::band::{BAND_COUNT, Band};
+use crate::fft::{Complex, Fft};
 use crate::image::Arrival;
 use crate::rng::Rng;
 
@@ -141,148 +144,221 @@ impl std::fmt::Display for IrError {
 
 impl std::error::Error for IrError {}
 
-/// Synthesise a pressure impulse response from specular arrivals and a late echogram.
-///
-/// A dense reflection sequence has random phase, so its pressure is band-limited noise with
-/// the echogram as envelope. Per band, white Gaussian noise is band-filtered, shaped by the
-/// late echogram (variance per sample = bin energy / samples in the bin), and then rescaled
-/// window by window so each window holds exactly the echogram's energy. Without that last
-/// step the energy of a band-noise realisation scatters by about 1/√(B·T) (bandwidth times
-/// duration), tens of percent in the 125 Hz band of a short tail. Each window spans at
-/// least four periods of the band centre, so the gain steps stay slow against the band's
-/// own oscillation and add little energy outside it.
-///
-/// Each specular arrival adds a band-filtered impulse of energy E at its exact sample (the
-/// filter normalised so Σh² = 1), and the bands are summed. Every band of the result carries
-/// the simulated energy on the echogram's scale: Σ p² of the late part equals the echogram
-/// total up to the small correlation between independent noises in overlapping bands.
-///
-/// The band filters are causal (two biquads per band), so energy is delayed by their group
-/// delay, a few milliseconds at 125 Hz; decay rates are unaffected.
+/// Width of the crossover between neighbouring band masks, octaves. Narrow, so a consumer's
+/// octave filter at the nominal edges sees little of the neighbouring band; wide enough that
+/// a band-limited impulse rings for only a few hundred milliseconds at the 125 Hz band's
+/// lower edge (the ringing lasts about 1/Δf, Δf ≈ 89 Hz · ln2 · width).
+const CROSSOVER_OCT: f64 = 1.0 / 12.0;
+
+/// Synthesise a pressure impulse response from specular arrivals and a late echogram: the
+/// sum of [`synthesize_band_irs`] with the same seed.
 pub fn synthesize_ir(
     arrivals: &[Arrival],
     late: &Echogram,
     sample_rate: f64,
     seed: u64,
 ) -> Result<Vec<f64>, IrError> {
-    if !(sample_rate.is_finite() && sample_rate > 2.0 * Band::Hz8k.upper_hz()) {
-        return Err(IrError::SampleRateTooLow);
-    }
-    let n = (late.duration_s() * sample_rate).ceil() as usize;
-    let mut out = vec![0.0; n];
-    let mut env = vec![0.0; n];
-    let mut x = vec![0.0; n];
-    for b in Band::ALL {
-        let e = late.band(b);
-        env.iter_mut().for_each(|v| *v = 0.0);
-        for (k, &energy) in e.iter().enumerate() {
-            let s0 = ((k as f64 * late.bin_s) * sample_rate).round() as usize;
-            let s1 = ((((k + 1) as f64) * late.bin_s) * sample_rate).round() as usize;
-            let s1 = s1.min(n);
-            if s1 <= s0 || energy <= 0.0 {
-                continue;
-            }
-            let var = energy / (s1 - s0) as f64;
-            env[s0..s1].iter_mut().for_each(|v| *v = var);
-        }
-
-        let mut filter = OctaveFilter::new(b.exact_hz(), sample_rate);
-        let mut rng = Rng::new(seed, 0x1f_0000 + b.index() as u64, 0);
-        for (xi, &v) in x.iter_mut().zip(&env) {
-            *xi = filter.process(rng.normal()) * v.sqrt();
-        }
-        let window = ((4.0 * sample_rate / b.exact_hz()).ceil() as usize).max(1);
-        for (xs, es) in x.chunks_mut(window).zip(env.chunks(window)) {
-            let want: f64 = es.iter().sum();
-            let got: f64 = xs.iter().map(|v| v * v).sum();
-            if got > 0.0 {
-                let g = (want / got).sqrt();
-                xs.iter_mut().for_each(|v| *v *= g);
-            }
-        }
-
-        // Impulses: filter an excitation of √E per arrival.
-        x.iter_mut()
-            .zip(out.iter_mut())
-            .for_each(|(xi, o)| *o += *xi);
-        x.iter_mut().for_each(|v| *v = 0.0);
-        let mut any = false;
-        for a in arrivals {
-            let s = (a.time_s * sample_rate).round() as usize;
-            if s < n {
-                x[s] += a.energy[b.index()].sqrt();
-                any = true;
-            }
-        }
-        if any {
-            let gain = 1.0 / filter.energy_gain().sqrt();
-            filter.reset();
-            for (o, &xi) in out.iter_mut().zip(&x) {
-                *o += gain * filter.process(xi);
-            }
-        }
+    let bands = synthesize_band_irs(arrivals, late, sample_rate, seed)?;
+    let mut out = vec![0.0; bands[0].len()];
+    for band in &bands {
+        out.iter_mut().zip(band).for_each(|(o, v)| *o += v);
     }
     Ok(out)
 }
 
-/// An octave band-pass: two identical second-order band-passes in cascade. A second-order
-/// band-pass has |H|² = 1/(1 + Q²(f/f₀ − f₀/f)²); for the cascade (|H|⁴) to be 3 dB down at
-/// the octave edges f₀·2^(±1/2), where f/f₀ − f₀/f = 2^(−1/2), each stage needs
-/// Q·2^(−1/2) = √(√2 − 1), so Q ≈ 0.910.
-struct OctaveFilter {
-    b: [f64; 3],
-    a: [f64; 2],
-    s: [[f64; 2]; 2],
+/// Synthesise one pressure impulse response per octave band (indexed by [`Band::index`]),
+/// each carrying only that band's energy, all of the length of the echogram.
+///
+/// A dense reflection sequence has random phase, so its pressure is band-limited noise with
+/// the echogram as envelope. Per band, white Gaussian noise is band-limited, shaped by the
+/// late echogram (variance per sample = bin energy / samples in the bin), and then rescaled
+/// window by window so each window holds the echogram's energy. Without that step the energy
+/// of a band-noise realisation scatters by about 1/√(B·T) (bandwidth times duration), tens
+/// of percent in the 125 Hz band of a short tail. Each window spans four periods of the band
+/// centre, so the gain steps stay slow against the band's own oscillation. The shaped noise
+/// is band-limited once more, to remove what the envelope and gain steps spread outside the
+/// band, and scaled so its total equals the late echogram's. Each specular arrival adds a
+/// band-limited impulse of energy E at its exact sample.
+///
+/// Band limiting is a mask on the spectrum, flat across the octave and falling to zero
+/// within a twelfth of an octave around each edge, power-complementary with the neighbouring
+/// band's so the bands sum to a flat response. A recursive band-pass would not do: a
+/// second-order pair is only about 36 dB down three octaves away, and the decay curves of
+/// different bands drift apart by tens of dB over a tail, so a slow 125 Hz decay leaking
+/// through that skirt dominates a fast 1 kHz decay well before −25 dB and a T20 read through
+/// an external octave filter comes out several times too long. With the mask, a band holds
+/// nothing beyond its crossovers, and an octave filter at the nominal edges sees the
+/// neighbouring band only within half a crossover.
+///
+/// The mask has zero phase, so a band-limited impulse rings symmetrically about its arrival:
+/// the response starts a few milliseconds before the direct sound (at the 125 Hz band
+/// longest), and what would precede t = 0 is dropped. Energy arriving within a ringing time
+/// of the end is likewise cut, so the energies match the echogram's to well under 1 %.
+pub fn synthesize_band_irs(
+    arrivals: &[Arrival],
+    late: &Echogram,
+    sample_rate: f64,
+    seed: u64,
+) -> Result<[Vec<f64>; BAND_COUNT], IrError> {
+    if !(sample_rate.is_finite() && sample_rate > 2.0 * Band::Hz8k.upper_hz()) {
+        return Err(IrError::SampleRateTooLow);
+    }
+    let n = (late.duration_s() * sample_rate).ceil() as usize;
+    if n == 0 {
+        return Ok(std::array::from_fn(|_| Vec::new()));
+    }
+    // The masks act circularly; a guard of several ringing times after the end keeps what
+    // rings past the end, or before t = 0, from wrapping onto the kept samples.
+    let df = Band::Hz125.lower_hz() * std::f64::consts::LN_2 * CROSSOVER_OCT;
+    let guard = (6.0 / df * sample_rate).ceil() as usize;
+    let len = (n + guard).next_power_of_two();
+    let fft = Fft::new(len);
+    let bands: Vec<Vec<f64>> = Band::ALL
+        .par_iter()
+        .map(|&b| band_ir(b, arrivals, late, sample_rate, seed, n, &fft))
+        .collect();
+    let mut bands = bands.into_iter();
+    Ok(std::array::from_fn(|_| {
+        bands.next().expect("one IR per band")
+    }))
 }
 
-impl OctaveFilter {
-    fn new(f0: f64, fs: f64) -> OctaveFilter {
-        let q = (std::f64::consts::SQRT_2 - 1.0).sqrt() * std::f64::consts::SQRT_2;
-        // Bilinear transform with the centre pre-warped (RBJ cookbook band-pass, 0 dB peak).
-        let w0 = std::f64::consts::TAU * f0 / fs;
-        let alpha = w0.sin() / (2.0 * q);
-        let a0 = 1.0 + alpha;
-        OctaveFilter {
-            b: [alpha / a0, 0.0, -alpha / a0],
-            a: [-2.0 * w0.cos() / a0, (1.0 - alpha) / a0],
-            s: [[0.0; 2]; 2],
+fn band_ir(
+    b: Band,
+    arrivals: &[Arrival],
+    late: &Echogram,
+    sample_rate: f64,
+    seed: u64,
+    n: usize,
+    fft: &Fft,
+) -> Vec<f64> {
+    let len = fft.n;
+    let mask: Vec<f64> = (0..len)
+        .map(|k| band_mask(b, k.min(len - k) as f64 * sample_rate / len as f64))
+        .collect();
+    let apply = |x: &mut [Complex]| {
+        fft.forward(x);
+        x.iter_mut().zip(&mask).for_each(|(v, &m)| {
+            v[0] *= m;
+            v[1] *= m;
+        });
+        fft.inverse(x);
+    };
+
+    let mut env = vec![0.0; n];
+    for (k, &energy) in late.band(b).iter().enumerate() {
+        let s0 = ((k as f64 * late.bin_s) * sample_rate).round() as usize;
+        let s1 = ((((k + 1) as f64) * late.bin_s) * sample_rate).round() as usize;
+        let s1 = s1.min(n);
+        if s1 <= s0 || energy <= 0.0 {
+            continue;
+        }
+        let var = energy / (s1 - s0) as f64;
+        env[s0..s1].iter_mut().for_each(|v| *v = var);
+    }
+    let want_late: f64 = env.iter().sum();
+
+    // Stationary band noise: the real part of masked complex white noise is real band noise
+    // (the mask is even in frequency).
+    let mut rng = Rng::new(seed, 0x1f_0000 + b.index() as u64, 0);
+    let mut buf: Vec<Complex> = (0..len).map(|_| [rng.normal(), rng.normal()]).collect();
+    apply(&mut buf);
+    let mut x: Vec<f64> = buf[..n]
+        .iter()
+        .zip(&env)
+        .map(|(v, &e)| v[0] * e.sqrt())
+        .collect();
+    let window = ((4.0 * sample_rate / b.exact_hz()).ceil() as usize).max(1);
+    for (xs, es) in x.chunks_mut(window).zip(env.chunks(window)) {
+        let want: f64 = es.iter().sum();
+        let got: f64 = xs.iter().map(|v| v * v).sum();
+        if got > 0.0 {
+            let g = (want / got).sqrt();
+            xs.iter_mut().for_each(|v| *v *= g);
         }
     }
 
-    fn reset(&mut self) {
-        self.s = [[0.0; 2]; 2];
-    }
-
-    /// Transposed direct form II, two stages.
-    fn process(&mut self, mut x: f64) -> f64 {
-        for st in &mut self.s {
-            let y = self.b[0] * x + st[0];
-            st[0] = self.b[1] * x - self.a[0] * y + st[1];
-            st[1] = self.b[2] * x - self.a[1] * y;
-            x = y;
+    // Second pass: the shaped noise in the real part, the arrivals' impulses (√E each) in
+    // the imaginary part. Mask and signals are real, so the two stay apart.
+    buf.iter_mut().for_each(|v| *v = [0.0, 0.0]);
+    buf[..n].iter_mut().zip(&x).for_each(|(v, &xi)| v[0] = xi);
+    for a in arrivals {
+        let s = (a.time_s * sample_rate).round() as usize;
+        if s < n {
+            buf[s][1] += a.energy[b.index()].sqrt();
         }
-        x
     }
+    apply(&mut buf);
+    let got_late: f64 = buf[..n].iter().map(|v| v[0] * v[0]).sum();
+    let g_late = if got_late > 0.0 {
+        (want_late / got_late).sqrt()
+    } else {
+        0.0
+    };
+    // A masked unit impulse has energy Σ|M_k|²/len (Parseval).
+    let mask_energy: f64 = mask.iter().map(|m| m * m).sum::<f64>() / len as f64;
+    let g_imp = if mask_energy > 0.0 {
+        1.0 / mask_energy.sqrt()
+    } else {
+        0.0
+    };
+    buf[..n]
+        .iter()
+        .map(|v| g_late * v[0] + g_imp * v[1])
+        .collect()
+}
 
-    /// Σh² of the impulse response: the factor by which the filter scales white noise's
-    /// power and an impulse's energy alike.
-    fn energy_gain(&mut self) -> f64 {
-        self.reset();
-        let mut sum = 0.0;
-        let mut x = 1.0;
-        let mut quiet = 0;
-        // The ringing passes through zero every half period, so the response has ended only
-        // once a run of samples longer than any half period has stayed negligible. A
-        // million samples bounds the loop for any rate.
-        for _ in 0..1_000_000 {
-            let y = self.process(x);
-            x = 0.0;
-            sum += y * y;
-            quiet = if y.abs() < 1e-15 { quiet + 1 } else { 0 };
-            if quiet > 4096 {
-                break;
+/// The band's amplitude mask at `f` Hz: 1 inside the octave, 0 outside, crossing over in
+/// log frequency around each edge as cos/sin of a raised-cosine ramp, so the squared masks of
+/// two neighbouring bands sum to 1 and the ramp has no kink to make the impulse ring long.
+fn band_mask(b: Band, f: f64) -> f64 {
+    if f <= 0.0 {
+        return 0.0;
+    }
+    // Base-10 bands are spaced 10^0.3, not 2, so one band's upper edge and the next one's
+    // lower edge differ by 0.2 %; neighbours cross over at the geometric mean of their
+    // centres so the masks stay complementary.
+    let i = b.index();
+    let lower = match i {
+        0 => b.lower_hz(),
+        _ => (Band::ALL[i - 1].exact_hz() * b.exact_hz()).sqrt(),
+    };
+    let upper = match Band::ALL.get(i + 1) {
+        None => b.upper_hz(),
+        Some(next) => (b.exact_hz() * next.exact_hz()).sqrt(),
+    };
+    let x = f.log2();
+    rise(x - lower.log2()) * rise(upper.log2() - x)
+}
+
+/// 0 below −CROSSOVER_OCT/2 octaves from an edge, 1 above +CROSSOVER_OCT/2.
+fn rise(d: f64) -> f64 {
+    let h = CROSSOVER_OCT / 2.0;
+    if d <= -h {
+        0.0
+    } else if d >= h {
+        1.0
+    } else {
+        let s = 0.5 * (1.0 + (std::f64::consts::PI * d / CROSSOVER_OCT).sin());
+        (std::f64::consts::FRAC_PI_2 * s).sin()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neighbouring_masks_are_power_complementary() {
+        for i in 0..2000 {
+            let f = 60.0 * 2f64.powf(i as f64 * 8.0 / 2000.0);
+            let sum: f64 = Band::ALL.iter().map(|&b| band_mask(b, f).powi(2)).sum();
+            let inside = f > Band::Hz125.lower_hz() * 2f64.powf(CROSSOVER_OCT / 2.0)
+                && f < Band::Hz8k.upper_hz() / 2f64.powf(CROSSOVER_OCT / 2.0);
+            if inside {
+                assert!((sum - 1.0).abs() < 1e-12, "{f} Hz: Σ|M|² = {sum}");
             }
+            assert!(sum <= 1.0 + 1e-12);
         }
-        sum
     }
 }

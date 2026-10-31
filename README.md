@@ -11,7 +11,9 @@ ceiling, which covers halls, fan-shaped auditoria, L-shaped bars and wedges. Per
   spheres as a per-band echogram, deterministic per seed whatever the thread count (rayon);
 - **air absorption** after ISO 9613-1;
 - Schroeder decay curves and T20/T30 fits, and an **impulse response** synthesised from
-  the echogram for analysis by tools that work on measured IRs.
+  the echogram for analysis by tools that work on measured IRs, broadband or one per
+  octave band (`band_impulse_responses`). Bands are cut with a steep spectral mask, so an
+  octave filter on the broadband IR does not pick up a neighbouring band's slower decay.
 
 ```rust
 use ac2_roomsim::*;
@@ -35,6 +37,7 @@ for a in &sim.receivers[0].arrivals[..4] {
 }
 let t30 = sim.receivers[0].echogram().t30(Band::Hz1k);
 let ir = sim.receivers[0].impulse_response(48_000.0, 1)?;
+let per_band = sim.receivers[0].band_impulse_responses(48_000.0, 1)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
